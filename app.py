@@ -57,6 +57,8 @@ if 'phone_entered' not in st.session_state:
     st.session_state.phone_entered = False
 if 'code_sent' not in st.session_state:
     st.session_state.code_sent = False
+if 'phone_code_hash' not in st.session_state:
+    st.session_state.phone_code_hash = None
 
 # Sidebar for API credentials
 with st.sidebar:
@@ -107,27 +109,29 @@ async def leave_entity_by_id(client, entity_id, entity_type):
         st.error(f"Error leaving entity {entity_id}: {str(e)}")
         return False
 
-async def authenticate_user(api_id, api_hash, phone, verification_code=None):
+async def authenticate_user(api_id, api_hash, phone, verification_code=None, phone_code_hash=None):
     """Handle user authentication"""
     try:
         client = TelegramClient('session', api_id, api_hash)
         await client.connect()
         
         if not await client.is_user_authorized():
-            if verification_code:
-                await client.sign_in(phone, verification_code)
+            if verification_code and phone_code_hash:
+                await client.sign_in(phone, verification_code, phone_code_hash=phone_code_hash)
                 session_string = client.session.save()
                 await client.disconnect()
                 return True, session_string
             else:
-                await client.send_code_request(phone)
+                result = await client.send_code_request(phone)
+                phone_code_hash = result.phone_code_hash
                 await client.disconnect()
-                return False, "code_sent"
+                return False, phone_code_hash
         else:
             session_string = client.session.save()
             await client.disconnect()
             return True, session_string
     except Exception as e:
+        await client.disconnect()
         return False, str(e)
 
 def main():
@@ -144,10 +148,12 @@ def main():
             if st.button("Send Verification Code") and phone:
                 try:
                     success, result = asyncio.run(authenticate_user(int(api_id), api_hash, phone))
-                    if result == "code_sent":
+                    if not success and result != "code_sent":
+                        # result contains phone_code_hash
                         st.session_state.phone_entered = True
                         st.session_state.phone = phone
                         st.session_state.code_sent = True
+                        st.session_state.phone_code_hash = result
                         st.success("Verification code sent! Please check your Telegram app.")
                         st.rerun()
                     elif success:
@@ -166,7 +172,13 @@ def main():
             if st.button("Verify Code") and verification_code:
                 try:
                     success, result = asyncio.run(
-                        authenticate_user(int(api_id), api_hash, st.session_state.phone, verification_code)
+                        authenticate_user(
+                            int(api_id), 
+                            api_hash, 
+                            st.session_state.phone, 
+                            verification_code, 
+                            st.session_state.phone_code_hash
+                        )
                     )
                     if success:
                         st.session_state.logged_in = True
@@ -251,7 +263,7 @@ def main():
 
 # Logout functionality
 if st.sidebar.button("🚪 Logout", key="logout"):
-    for key in ['client', 'logged_in', 'phone_entered', 'code_sent', 'phone', 'session_string', 'found_groups']:
+    for key in ['client', 'logged_in', 'phone_entered', 'code_sent', 'phone', 'phone_code_hash', 'session_string', 'found_groups']:
         if key in st.session_state:
             del st.session_state[key]
     st.rerun()
