@@ -5,7 +5,7 @@ from telethon.sessions import StringSession
 from telethon.tl.types import Channel, Chat
 from telethon.tl.functions.channels import LeaveChannelRequest
 from telethon.tl.functions.messages import DeleteChatUserRequest
-from telethon.errors import PhoneCodeExpiredError, PhoneCodeInvalidError, SessionPasswordNeededError
+from telethon.errors import PhoneCodeExpiredError, PhoneCodeInvalidError, SessionPasswordNeededError, FloodWaitError
 import os
 from dotenv import load_dotenv
 
@@ -60,76 +60,168 @@ class TelegramAuthenticator:
     async def start_auth(self, phone):
         """Start authentication process and send verification code"""
         try:
-            # Create client with StringSession for better session management
-            self.client = TelegramClient(StringSession(), self.api_id, self.api_hash)
+            # Create client with StringSession and timeout
+            self.client = TelegramClient(
+                StringSession(), 
+                self.api_id, 
+                self.api_hash,
+                connection_retries=1,
+                retry_delay=1
+            )
             
-            # Use the with pattern as recommended by Telethon docs
-            async with self.client:
-                if await self.client.is_user_authorized():
-                    # Already authorized, return session
+            # Add timeout to prevent hanging
+            try:
+                await asyncio.wait_for(self.client.connect(), timeout=10.0)
+            except asyncio.TimeoutError:
+                return False, None, "Connection timeout - please check your internet connection"
+            
+            # Check if already authorized
+            try:
+                is_authorized = await asyncio.wait_for(
+                    self.client.is_user_authorized(), 
+                    timeout=5.0
+                )
+                if is_authorized:
                     session_string = self.client.session.save()
+                    await self.client.disconnect()
                     return True, session_string, "already_authorized"
+            except asyncio.TimeoutError:
+                await self.client.disconnect()
+                return False, None, "Authorization check timeout"
+            
+            # Send code request with timeout
+            try:
+                sent_code = await asyncio.wait_for(
+                    self.client.send_code_request(phone), 
+                    timeout=15.0
+                )
+                self.phone_code_hash = sent_code.phone_code_hash
                 
-                # Send code request and keep connection alive
-                try:
-                    sent_code = await self.client.send_code_request(phone)
-                    self.phone_code_hash = sent_code.phone_code_hash
-                    
-                    # Save the session state but keep client reference
-                    session_string = self.client.session.save()
-                    return False, session_string, "code_sent"
-                    
-                except Exception as e:
+                # Save the session state
+                session_string = self.client.session.save()
+                await self.client.disconnect()
+                return False, session_string, "code_sent"
+                
+            except asyncio.TimeoutError:
+                await self.client.disconnect()
+                return False, None, "Code request timeout - please try again"
+            except FloodWaitError as e:
+                await self.client.disconnect()
+                return False, None, f"Rate limited - please wait {e.seconds} seconds"
+            except Exception as e:
+                await self.client.disconnect()
+                error_msg = str(e).lower()
+                if "phone number" in error_msg:
+                    return False, None, "Invalid phone number format"
+                elif "flood" in error_msg:
+                    return False, None, "Too many attempts - please wait and try again"
+                else:
                     return False, None, f"Failed to send code: {str(e)}"
                     
         except Exception as e:
+            try:
+                if self.client:
+                    await self.client.disconnect()
+            except:
+                pass
             return False, None, f"Connection error: {str(e)}"
     
     async def verify_code(self, phone, code, session_string):
         """Verify the code using the same session"""
         try:
             # Recreate client with the saved session
-            self.client = TelegramClient(StringSession(session_string), self.api_id, self.api_hash)
+            self.client = TelegramClient(
+                StringSession(session_string), 
+                self.api_id, 
+                self.api_hash,
+                connection_retries=1,
+                retry_delay=1
+            )
             
-            async with self.client:
-                try:
-                    # Use the stored phone_code_hash for verification
-                    await self.client.sign_in(phone, code, phone_code_hash=self.phone_code_hash)
-                    
-                    # Save the authenticated session
+            try:
+                await asyncio.wait_for(self.client.connect(), timeout=10.0)
+            except asyncio.TimeoutError:
+                return False, None, "Connection timeout during verification"
+            
+            try:
+                # Use the stored phone_code_hash for verification
+                await asyncio.wait_for(
+                    self.client.sign_in(phone, code, phone_code_hash=self.phone_code_hash),
+                    timeout=10.0
+                )
+                
+                # Save the authenticated session
+                final_session = self.client.session.save()
+                await self.client.disconnect()
+                return True, final_session, "success"
+                
+            except asyncio.TimeoutError:
+                await self.client.disconnect()
+                return False, None, "Verification timeout - please try again"
+            except PhoneCodeExpiredError:
+                await self.client.disconnect()
+                return False, None, "code_expired"
+            except PhoneCodeInvalidError:
+                await self.client.disconnect()
+                return False, None, "invalid_code"
+            except SessionPasswordNeededError:
+                final_session = self.client.session.save()
+                await self.client.disconnect()
+                return False, final_session, "2fa_required"
+            except Exception as e:
+                await self.client.disconnect()
+                error_msg = str(e).lower()
+                if "password" in error_msg or "two-factor" in error_msg:
                     final_session = self.client.session.save()
-                    return True, final_session, "success"
-                    
-                except PhoneCodeExpiredError:
-                    return False, None, "code_expired"
-                except PhoneCodeInvalidError:
-                    return False, None, "invalid_code"
-                except SessionPasswordNeededError:
-                    return False, session_string, "2fa_required"
-                except Exception as e:
-                    error_msg = str(e).lower()
-                    if "password" in error_msg or "two-factor" in error_msg:
-                        return False, session_string, "2fa_required"
-                    else:
-                        return False, None, f"Sign-in error: {str(e)}"
+                    return False, final_session, "2fa_required"
+                else:
+                    return False, None, f"Sign-in error: {str(e)}"
                         
         except Exception as e:
+            try:
+                if self.client:
+                    await self.client.disconnect()
+            except:
+                pass
             return False, None, f"Verification error: {str(e)}"
     
     async def verify_2fa(self, password, session_string):
         """Verify 2FA password"""
         try:
-            self.client = TelegramClient(StringSession(session_string), self.api_id, self.api_hash)
+            self.client = TelegramClient(
+                StringSession(session_string), 
+                self.api_id, 
+                self.api_hash,
+                connection_retries=1,
+                retry_delay=1
+            )
             
-            async with self.client:
-                try:
-                    await self.client.sign_in(password=password)
-                    final_session = self.client.session.save()
-                    return True, final_session, "success"
-                except Exception as e:
-                    return False, None, f"2FA error: {str(e)}"
+            try:
+                await asyncio.wait_for(self.client.connect(), timeout=10.0)
+            except asyncio.TimeoutError:
+                return False, None, "Connection timeout during 2FA"
+            
+            try:
+                await asyncio.wait_for(
+                    self.client.sign_in(password=password),
+                    timeout=10.0
+                )
+                final_session = self.client.session.save()
+                await self.client.disconnect()
+                return True, final_session, "success"
+            except asyncio.TimeoutError:
+                await self.client.disconnect()
+                return False, None, "2FA timeout - please try again"
+            except Exception as e:
+                await self.client.disconnect()
+                return False, None, f"2FA error: {str(e)}"
                     
         except Exception as e:
+            try:
+                if self.client:
+                    await self.client.disconnect()
+            except:
+                pass
             return False, None, f"2FA connection error: {str(e)}"
 
 # Initialize session state
@@ -260,12 +352,41 @@ def main():
         
         if not st.session_state.phone_entered:
             phone = st.text_input("Enter your phone number (with country code, e.g., +1234567890):")
-            if st.button("Send Verification Code", type="primary") and phone:
-                with st.spinner("Sending verification code..."):
+            
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                send_code_btn = st.button("Send Verification Code", type="primary", disabled=not phone)
+            with col2:
+                if st.button("❌ Cancel") and 'sending_code' in st.session_state:
+                    if 'sending_code' in st.session_state:
+                        del st.session_state.sending_code
+                    st.rerun()
+            
+            if send_code_btn and phone:
+                st.session_state.sending_code = True
+                progress_container = st.container()
+                
+                with progress_container:
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
+                    status_text.text("🔗 Connecting to Telegram...")
+                    progress_bar.progress(25)
+                    
                     try:
+                        # Run authentication with progress updates
                         success, session_result, status = asyncio.run(
                             st.session_state.authenticator.start_auth(phone)
                         )
+                        
+                        progress_bar.progress(100)
+                        status_text.text("✅ Complete!")
+                        
+                        # Clear progress indicators
+                        progress_container.empty()
+                        
+                        if 'sending_code' in st.session_state:
+                            del st.session_state.sending_code
                         
                         if status == "already_authorized":
                             st.session_state.logged_in = True
@@ -282,8 +403,19 @@ def main():
                             st.rerun()
                         else:
                             st.error(f"Failed to send code: {status}")
+                            
                     except Exception as e:
+                        progress_container.empty()
+                        if 'sending_code' in st.session_state:
+                            del st.session_state.sending_code
                         st.error(f"Error: {str(e)}")
+                        
+            elif 'sending_code' in st.session_state:
+                st.info("🔄 Sending verification code... This may take up to 30 seconds.")
+                if st.button("🛑 Cancel Operation"):
+                    if 'sending_code' in st.session_state:
+                        del st.session_state.sending_code
+                    st.rerun()
         
         elif st.session_state.code_sent and not st.session_state.get('requires_2fa', False):
             st.info("📱 Enter the verification code from your Telegram app")
