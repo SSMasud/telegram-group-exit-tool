@@ -53,6 +53,10 @@ if 'client' not in st.session_state:
     st.session_state.client = None
 if 'logged_in' not in st.session_state:
     st.session_state.logged_in = False
+if 'phone_entered' not in st.session_state:
+    st.session_state.phone_entered = False
+if 'code_sent' not in st.session_state:
+    st.session_state.code_sent = False
 
 # Sidebar for API credentials
 with st.sidebar:
@@ -67,95 +71,191 @@ with st.sidebar:
     
     api_id = st.text_input("API ID", type="password", help="Enter your Telegram API ID")
     api_hash = st.text_input("API Hash", type="password", help="Enter your Telegram API Hash")
-    
-async def get_target_groups(client, word):
-    matches = []
-    async for dlg in client.iter_dialogs():
-        ent = dlg.entity
-        title = getattr(ent, 'title', '') or ''
-        if word.lower() in title.lower():
-            matches.append((ent, title))
-    return matches
 
-async def leave_entity(client, ent):
-    if isinstance(ent, Channel):
-        await client(LeaveChannelRequest(ent))
-    elif isinstance(ent, Chat):
-        await client(DeleteChatUserRequest(ent.id, 'me'))
-
-async def initialize_client(api_id, api_hash):
-    try:
-        client = TelegramClient('anon', api_id, api_hash)
+@st.cache_data
+def get_target_groups_sync(api_id, api_hash, word, session_string=None):
+    """Synchronous wrapper for async function to work with Streamlit caching"""
+    async def _get_groups():
+        client = TelegramClient('session', api_id, api_hash)
+        if session_string:
+            client.session.load(session_string)
+        
         await client.connect()
-        if not await client.is_user_authorized():
-            phone = st.text_input("Enter your phone number (with country code):")
-            if phone:
-                try:
-                    code = await client.send_code_request(phone)
-                    verification_code = st.text_input("Enter the verification code sent to your Telegram app:")
-                    if verification_code:
-                        await client.sign_in(phone, verification_code)
-                        st.session_state.logged_in = True
-                        return client
-                except Exception as e:
-                    st.error(f"Error during authentication: {str(e)}")
-                    return None
-        else:
-            st.session_state.logged_in = True
-            return client
-    except Exception as e:
-        st.error(f"Error initializing client: {str(e)}")
-        return None
+        matches = []
+        try:
+            async for dlg in client.iter_dialogs():
+                ent = dlg.entity
+                title = getattr(ent, 'title', '') or ''
+                if word.lower() in title.lower():
+                    matches.append((ent.id, title, type(ent).__name__))
+        finally:
+            await client.disconnect()
+        return matches
+    
+    return asyncio.run(_get_groups())
 
-async def main():
+async def leave_entity_by_id(client, entity_id, entity_type):
+    """Leave entity by ID and type"""
+    try:
+        if entity_type == 'Channel':
+            entity = await client.get_entity(entity_id)
+            await client(LeaveChannelRequest(entity))
+        elif entity_type == 'Chat':
+            await client(DeleteChatUserRequest(entity_id, 'me'))
+        return True
+    except Exception as e:
+        st.error(f"Error leaving entity {entity_id}: {str(e)}")
+        return False
+
+async def authenticate_user(api_id, api_hash, phone, verification_code=None):
+    """Handle user authentication"""
+    try:
+        client = TelegramClient('session', api_id, api_hash)
+        await client.connect()
+        
+        if not await client.is_user_authorized():
+            if verification_code:
+                await client.sign_in(phone, verification_code)
+                session_string = client.session.save()
+                await client.disconnect()
+                return True, session_string
+            else:
+                await client.send_code_request(phone)
+                await client.disconnect()
+                return False, "code_sent"
+        else:
+            session_string = client.session.save()
+            await client.disconnect()
+            return True, session_string
+    except Exception as e:
+        return False, str(e)
+
+def main():
     if not api_id or not api_hash:
         st.warning("Please enter your API credentials in the sidebar.")
         return
 
-    if not st.session_state.client and not st.session_state.logged_in:
-        st.session_state.client = await initialize_client(int(api_id), api_hash)
+    # Authentication flow
+    if not st.session_state.logged_in:
+        st.subheader("🔐 Authentication")
+        
+        if not st.session_state.phone_entered:
+            phone = st.text_input("Enter your phone number (with country code, e.g., +1234567890):")
+            if st.button("Send Verification Code") and phone:
+                try:
+                    success, result = asyncio.run(authenticate_user(int(api_id), api_hash, phone))
+                    if result == "code_sent":
+                        st.session_state.phone_entered = True
+                        st.session_state.phone = phone
+                        st.session_state.code_sent = True
+                        st.success("Verification code sent! Please check your Telegram app.")
+                        st.rerun()
+                    elif success:
+                        st.session_state.logged_in = True
+                        st.session_state.session_string = result
+                        st.success("Authentication successful!")
+                        st.rerun()
+                    else:
+                        st.error(f"Authentication failed: {result}")
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
+        
+        elif st.session_state.code_sent:
+            st.info("Please enter the verification code sent to your Telegram app.")
+            verification_code = st.text_input("Verification Code:")
+            if st.button("Verify Code") and verification_code:
+                try:
+                    success, result = asyncio.run(
+                        authenticate_user(int(api_id), api_hash, st.session_state.phone, verification_code)
+                    )
+                    if success:
+                        st.session_state.logged_in = True
+                        st.session_state.session_string = result
+                        st.success("Authentication successful!")
+                        st.rerun()
+                    else:
+                        st.error(f"Verification failed: {result}")
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
 
-    if st.session_state.logged_in and st.session_state.client:
+    # Main functionality
+    if st.session_state.logged_in:
+        st.success("✅ Successfully authenticated!")
+        
         keyword = st.text_input("Enter the keyword to search for in group titles:", 
                               help="Groups containing this keyword will be listed for removal")
         
         if keyword:
-            if st.button("Search Groups"):
+            if st.button("🔍 Search Groups"):
                 with st.spinner("Searching for matching groups..."):
-                    groups = await get_target_groups(st.session_state.client, keyword)
+                    try:
+                        groups = get_target_groups_sync(
+                            int(api_id), api_hash, keyword, st.session_state.get('session_string')
+                        )
+                        
+                        if not groups:
+                            st.info("No groups found matching your keyword.")
+                            return
+                        
+                        st.session_state.found_groups = groups
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error searching groups: {str(e)}")
+            
+            # Display found groups
+            if 'found_groups' in st.session_state and st.session_state.found_groups:
+                st.write("### 📋 Found Groups:")
+                group_options = {f"{title} ({entity_type})": (entity_id, entity_type) 
+                               for entity_id, title, entity_type in st.session_state.found_groups}
+                
+                selected_groups = st.multiselect(
+                    "Select groups to leave:",
+                    options=list(group_options.keys()),
+                    default=list(group_options.keys())
+                )
+                
+                if selected_groups:
+                    st.warning(f"⚠️ You are about to leave {len(selected_groups)} group(s). This action cannot be undone.")
+                    confirm = st.checkbox("I confirm that I want to leave these groups")
                     
-                    if not groups:
-                        st.info("No groups found matching your keyword.")
-                        return
-                    
-                    st.write("### Found Groups:")
-                    group_options = {title: ent for ent, title in groups}
-                    selected_groups = st.multiselect(
-                        "Select groups to leave:",
-                        options=list(group_options.keys()),
-                        default=list(group_options.keys())
-                    )
-                    
-                    if selected_groups:
-                        if st.button("Leave Selected Groups", key="leave_groups"):
-                            confirm = st.checkbox("I confirm that I want to leave these groups")
-                            if confirm:
-                                progress_bar = st.progress(0)
-                                for i, title in enumerate(selected_groups):
-                                    try:
-                                        await leave_entity(st.session_state.client, group_options[title])
-                                        progress_bar.progress((i + 1) / len(selected_groups))
-                                        await asyncio.sleep(1.5)
-                                    except Exception as e:
-                                        st.error(f"Error leaving {title}: {str(e)}")
-                                st.success("Successfully left all selected groups!")
-                            else:
-                                st.warning("Please confirm that you want to leave these groups.")
+                    if confirm and st.button("🚪 Leave Selected Groups", type="primary"):
+                        progress_bar = st.progress(0)
+                        success_count = 0
+                        
+                        async def leave_groups():
+                            nonlocal success_count
+                            client = TelegramClient('session', int(api_id), api_hash)
+                            if 'session_string' in st.session_state:
+                                client.session.load(st.session_state.session_string)
+                            
+                            await client.connect()
+                            try:
+                                for i, group_name in enumerate(selected_groups):
+                                    entity_id, entity_type = group_options[group_name]
+                                    success = await leave_entity_by_id(client, entity_id, entity_type)
+                                    if success:
+                                        success_count += 1
+                                    progress_bar.progress((i + 1) / len(selected_groups))
+                                    await asyncio.sleep(1.5)  # Rate limiting
+                            finally:
+                                await client.disconnect()
+                        
+                        try:
+                            asyncio.run(leave_groups())
+                            st.success(f"✅ Successfully left {success_count}/{len(selected_groups)} groups!")
+                            # Clear the found groups to start fresh
+                            if 'found_groups' in st.session_state:
+                                del st.session_state.found_groups
+                        except Exception as e:
+                            st.error(f"Error during group leaving process: {str(e)}")
 
+# Logout functionality
+if st.sidebar.button("🚪 Logout", key="logout"):
+    for key in ['client', 'logged_in', 'phone_entered', 'code_sent', 'phone', 'session_string', 'found_groups']:
+        if key in st.session_state:
+            del st.session_state[key]
+    st.rerun()
+
+# Run the main function
 if __name__ == "__main__":
-    if st.sidebar.button("Logout", key="logout"):
-        st.session_state.client = None
-        st.session_state.logged_in = False
-        st.experimental_rerun()
-    
-    asyncio.run(main()) 
+    main() 
