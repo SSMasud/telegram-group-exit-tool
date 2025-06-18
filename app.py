@@ -91,24 +91,71 @@ def get_target_groups_sync(api_id, api_hash, word, session_string=None):
                 ent = dlg.entity
                 title = getattr(ent, 'title', '') or ''
                 if word.lower() in title.lower():
-                    matches.append((ent.id, title, type(ent).__name__))
+                    # Store more comprehensive entity information
+                    entity_info = {
+                        'id': ent.id,
+                        'title': title,
+                        'type': type(ent).__name__,
+                        'access_hash': getattr(ent, 'access_hash', None),
+                        'username': getattr(ent, 'username', None)
+                    }
+                    matches.append(entity_info)
         finally:
             await client.disconnect()
         return matches
     
     return asyncio.run(_get_groups())
 
-async def leave_entity_by_id(client, entity_id, entity_type):
-    """Leave entity by ID and type"""
+async def leave_entity_by_info(client, entity_info):
+    """Leave entity using comprehensive entity information"""
     try:
+        entity_id = entity_info['id']
+        entity_type = entity_info['type']
+        access_hash = entity_info['access_hash']
+        username = entity_info['username']
+        
+        # Try different methods to get the entity
+        entity = None
+        
+        # Method 1: Try by username if available
+        if username:
+            try:
+                entity = await client.get_entity(username)
+            except:
+                pass
+        
+        # Method 2: Try by ID with access_hash if available
+        if not entity and access_hash:
+            try:
+                if entity_type == 'Channel':
+                    from telethon.tl.types import PeerChannel
+                    entity = await client.get_entity(PeerChannel(entity_id))
+                elif entity_type == 'Chat':
+                    from telethon.tl.types import PeerChat
+                    entity = await client.get_entity(PeerChat(entity_id))
+            except:
+                pass
+        
+        # Method 3: Try by just ID as fallback
+        if not entity:
+            try:
+                entity = await client.get_entity(entity_id)
+            except:
+                pass
+        
+        if not entity:
+            raise Exception(f"Could not resolve entity: {entity_info['title']}")
+        
+        # Leave the entity
         if entity_type == 'Channel':
-            entity = await client.get_entity(entity_id)
             await client(LeaveChannelRequest(entity))
         elif entity_type == 'Chat':
-            await client(DeleteChatUserRequest(entity_id, 'me'))
+            await client(DeleteChatUserRequest(entity.id, 'me'))
+        
         return True
+        
     except Exception as e:
-        st.error(f"Error leaving entity {entity_id}: {str(e)}")
+        st.error(f"Error leaving {entity_info['title']}: {str(e)}")
         return False
 
 async def authenticate_user(api_id, api_hash, phone, verification_code=None, phone_code_hash=None):
@@ -219,8 +266,8 @@ def main():
             # Display found groups
             if 'found_groups' in st.session_state and st.session_state.found_groups:
                 st.write("### 📋 Found Groups:")
-                group_options = {f"{title} ({entity_type})": (entity_id, entity_type) 
-                               for entity_id, title, entity_type in st.session_state.found_groups}
+                group_options = {f"{group['title']} ({group['type']})": group 
+                               for group in st.session_state.found_groups}
                 
                 selected_groups = st.multiselect(
                     "Select groups to leave:",
@@ -246,8 +293,8 @@ def main():
                             await client.connect()
                             try:
                                 for i, group_name in enumerate(selected_groups):
-                                    entity_id, entity_type = group_options[group_name]
-                                    success = await leave_entity_by_id(client, entity_id, entity_type)
+                                    entity_info = group_options[group_name]
+                                    success = await leave_entity_by_info(client, entity_info)
                                     if success:
                                         success_count += 1
                                     progress_bar.progress((i + 1) / len(selected_groups))
