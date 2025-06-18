@@ -5,6 +5,7 @@ from telethon.sessions import StringSession
 from telethon.tl.types import Channel, Chat
 from telethon.tl.functions.channels import LeaveChannelRequest
 from telethon.tl.functions.messages import DeleteChatUserRequest
+from telethon.errors import PhoneCodeExpiredError, PhoneCodeInvalidError, SessionPasswordNeededError
 import os
 from dotenv import load_dotenv
 
@@ -49,6 +50,88 @@ This tool helps you automatically leave Telegram groups containing specific keyw
 Please enter your Telegram API credentials and the keyword to get started.
 """)
 
+class TelegramAuthenticator:
+    def __init__(self, api_id, api_hash):
+        self.api_id = api_id
+        self.api_hash = api_hash
+        self.client = None
+        self.phone_code_hash = None
+        
+    async def start_auth(self, phone):
+        """Start authentication process and send verification code"""
+        try:
+            # Create client with StringSession for better session management
+            self.client = TelegramClient(StringSession(), self.api_id, self.api_hash)
+            
+            # Use the with pattern as recommended by Telethon docs
+            async with self.client:
+                if await self.client.is_user_authorized():
+                    # Already authorized, return session
+                    session_string = self.client.session.save()
+                    return True, session_string, "already_authorized"
+                
+                # Send code request and keep connection alive
+                try:
+                    sent_code = await self.client.send_code_request(phone)
+                    self.phone_code_hash = sent_code.phone_code_hash
+                    
+                    # Save the session state but keep client reference
+                    session_string = self.client.session.save()
+                    return False, session_string, "code_sent"
+                    
+                except Exception as e:
+                    return False, None, f"Failed to send code: {str(e)}"
+                    
+        except Exception as e:
+            return False, None, f"Connection error: {str(e)}"
+    
+    async def verify_code(self, phone, code, session_string):
+        """Verify the code using the same session"""
+        try:
+            # Recreate client with the saved session
+            self.client = TelegramClient(StringSession(session_string), self.api_id, self.api_hash)
+            
+            async with self.client:
+                try:
+                    # Use the stored phone_code_hash for verification
+                    await self.client.sign_in(phone, code, phone_code_hash=self.phone_code_hash)
+                    
+                    # Save the authenticated session
+                    final_session = self.client.session.save()
+                    return True, final_session, "success"
+                    
+                except PhoneCodeExpiredError:
+                    return False, None, "code_expired"
+                except PhoneCodeInvalidError:
+                    return False, None, "invalid_code"
+                except SessionPasswordNeededError:
+                    return False, session_string, "2fa_required"
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    if "password" in error_msg or "two-factor" in error_msg:
+                        return False, session_string, "2fa_required"
+                    else:
+                        return False, None, f"Sign-in error: {str(e)}"
+                        
+        except Exception as e:
+            return False, None, f"Verification error: {str(e)}"
+    
+    async def verify_2fa(self, password, session_string):
+        """Verify 2FA password"""
+        try:
+            self.client = TelegramClient(StringSession(session_string), self.api_id, self.api_hash)
+            
+            async with self.client:
+                try:
+                    await self.client.sign_in(password=password)
+                    final_session = self.client.session.save()
+                    return True, final_session, "success"
+                except Exception as e:
+                    return False, None, f"2FA error: {str(e)}"
+                    
+        except Exception as e:
+            return False, None, f"2FA connection error: {str(e)}"
+
 # Initialize session state
 if 'client' not in st.session_state:
     st.session_state.client = None
@@ -60,6 +143,10 @@ if 'code_sent' not in st.session_state:
     st.session_state.code_sent = False
 if 'phone_code_hash' not in st.session_state:
     st.session_state.phone_code_hash = None
+if 'authenticator' not in st.session_state:
+    st.session_state.authenticator = None
+if 'temp_session' not in st.session_state:
+    st.session_state.temp_session = None
 
 # Sidebar for API credentials
 with st.sidebar:
@@ -84,25 +171,25 @@ def get_target_groups_sync(api_id, api_hash, word, session_string=None):
         else:
             client = TelegramClient(StringSession(), api_id, api_hash)
         
-        await client.connect()
-        matches = []
-        try:
-            async for dlg in client.iter_dialogs():
-                ent = dlg.entity
-                title = getattr(ent, 'title', '') or ''
-                if word.lower() in title.lower():
-                    # Store more comprehensive entity information
-                    entity_info = {
-                        'id': ent.id,
-                        'title': title,
-                        'type': type(ent).__name__,
-                        'access_hash': getattr(ent, 'access_hash', None),
-                        'username': getattr(ent, 'username', None)
-                    }
-                    matches.append(entity_info)
-        finally:
-            await client.disconnect()
-        return matches
+        async with client:
+            matches = []
+            try:
+                async for dlg in client.iter_dialogs():
+                    ent = dlg.entity
+                    title = getattr(ent, 'title', '') or ''
+                    if word.lower() in title.lower():
+                        # Store more comprehensive entity information
+                        entity_info = {
+                            'id': ent.id,
+                            'title': title,
+                            'type': type(ent).__name__,
+                            'access_hash': getattr(ent, 'access_hash', None),
+                            'username': getattr(ent, 'username', None)
+                        }
+                        matches.append(entity_info)
+            except Exception as e:
+                st.error(f"Error fetching groups: {str(e)}")
+            return matches
     
     return asyncio.run(_get_groups())
 
@@ -158,67 +245,14 @@ async def leave_entity_by_info(client, entity_info):
         st.error(f"Error leaving {entity_info['title']}: {str(e)}")
         return False
 
-async def authenticate_user(api_id, api_hash, phone, verification_code=None, phone_code_hash=None, password=None):
-    """Handle user authentication with improved error handling"""
-    client = TelegramClient(StringSession(), api_id, api_hash)
-    try:
-        await client.connect()
-        
-        if not await client.is_user_authorized():
-            if verification_code and phone_code_hash:
-                try:
-                    # Try to sign in with the verification code
-                    await client.sign_in(phone, verification_code, phone_code_hash=phone_code_hash)
-                    session_string = client.session.save()
-                    await client.disconnect()
-                    return True, session_string
-                except Exception as e:
-                    error_msg = str(e).lower()
-                    if "two-factor" in error_msg or "password" in error_msg:
-                        await client.disconnect()
-                        return False, "2fa_required"
-                    elif "invalid" in error_msg or "wrong" in error_msg:
-                        await client.disconnect()
-                        return False, "invalid_code"
-                    elif "expired" in error_msg:
-                        await client.disconnect()
-                        return False, "code_expired"
-                    else:
-                        await client.disconnect()
-                        return False, f"sign_in_error: {str(e)}"
-            elif password:
-                try:
-                    await client.sign_in(password=password)
-                    session_string = client.session.save()
-                    await client.disconnect()
-                    return True, session_string
-                except Exception as e:
-                    await client.disconnect()
-                    return False, f"password_error: {str(e)}"
-            else:
-                try:
-                    result = await client.send_code_request(phone)
-                    phone_code_hash = result.phone_code_hash
-                    await client.disconnect()
-                    return False, phone_code_hash
-                except Exception as e:
-                    await client.disconnect()
-                    return False, f"send_code_error: {str(e)}"
-        else:
-            session_string = client.session.save()
-            await client.disconnect()
-            return True, session_string
-    except Exception as e:
-        try:
-            await client.disconnect()
-        except:
-            pass
-        return False, f"connection_error: {str(e)}"
-
 def main():
     if not api_id or not api_hash:
         st.warning("Please enter your API credentials in the sidebar.")
         return
+
+    # Initialize authenticator
+    if not st.session_state.authenticator:
+        st.session_state.authenticator = TelegramAuthenticator(int(api_id), api_hash)
 
     # Authentication flow
     if not st.session_state.logged_in:
@@ -226,131 +260,125 @@ def main():
         
         if not st.session_state.phone_entered:
             phone = st.text_input("Enter your phone number (with country code, e.g., +1234567890):")
-            if st.button("Send Verification Code") and phone:
-                try:
-                    success, result = asyncio.run(authenticate_user(int(api_id), api_hash, phone))
-                    if not success and not result.startswith(("send_code_error", "connection_error")):
-                        # result contains phone_code_hash
-                        st.session_state.phone_entered = True
-                        st.session_state.phone = phone
-                        st.session_state.code_sent = True
-                        st.session_state.phone_code_hash = result
-                        st.success("Verification code sent! Please check your Telegram app.")
-                        st.info("⏰ Note: Verification codes expire in 2-3 minutes. Enter it quickly!")
-                        st.rerun()
-                    elif success:
-                        st.session_state.logged_in = True
-                        st.session_state.session_string = result
-                        st.success("Authentication successful!")
-                        st.rerun()
-                    else:
-                        st.error(f"Failed to send verification code: {result}")
-                except Exception as e:
-                    st.error(f"Error: {str(e)}")
+            if st.button("Send Verification Code", type="primary") and phone:
+                with st.spinner("Sending verification code..."):
+                    try:
+                        success, session_result, status = asyncio.run(
+                            st.session_state.authenticator.start_auth(phone)
+                        )
+                        
+                        if status == "already_authorized":
+                            st.session_state.logged_in = True
+                            st.session_state.session_string = session_result
+                            st.success("Already authenticated!")
+                            st.rerun()
+                        elif status == "code_sent":
+                            st.session_state.phone_entered = True
+                            st.session_state.phone = phone
+                            st.session_state.code_sent = True
+                            st.session_state.temp_session = session_result
+                            st.success("✅ Verification code sent! Check your Telegram app.")
+                            st.info("⚡ Enter the code IMMEDIATELY - it expires in 2-3 minutes!")
+                            st.rerun()
+                        else:
+                            st.error(f"Failed to send code: {status}")
+                    except Exception as e:
+                        st.error(f"Error: {str(e)}")
         
         elif st.session_state.code_sent and not st.session_state.get('requires_2fa', False):
-            st.info("Please enter the verification code sent to your Telegram app.")
-            st.warning("⏰ Enter the code IMMEDIATELY after receiving it!")
+            st.info("📱 Enter the verification code from your Telegram app")
+            st.warning("⚡ IMPORTANT: Enter the code within 2-3 minutes!")
             
             col1, col2 = st.columns([3, 1])
             
             with col1:
                 verification_code = st.text_input(
                     "Verification Code:", 
-                    placeholder="Enter 5-digit code",
+                    placeholder="12345",
                     max_chars=5,
-                    help="Enter the exact code you received"
+                    help="Enter the 5-digit code exactly as received"
                 )
             
             with col2:
-                if st.button("🔄 Resend Code"):
-                    try:
-                        success, result = asyncio.run(authenticate_user(int(api_id), api_hash, st.session_state.phone))
-                        if not success and not result.startswith(("send_code_error", "connection_error")):
-                            st.session_state.phone_code_hash = result
-                            st.success("New verification code sent!")
-                            st.rerun()
-                        else:
-                            st.error(f"Error resending code: {result}")
-                    except Exception as e:
-                        st.error(f"Error resending code: {str(e)}")
-            
-            if st.button("Verify Code", type="primary") and verification_code:
-                if len(verification_code) != 5 or not verification_code.isdigit():
-                    st.error("Please enter a valid 5-digit verification code")
-                else:
-                    try:
-                        success, result = asyncio.run(
-                            authenticate_user(
-                                int(api_id), 
-                                api_hash, 
-                                st.session_state.phone, 
-                                verification_code, 
-                                st.session_state.phone_code_hash
+                if st.button("🔄 New Code"):
+                    # Reset and get a new code
+                    with st.spinner("Sending new code..."):
+                        try:
+                            success, session_result, status = asyncio.run(
+                                st.session_state.authenticator.start_auth(st.session_state.phone)
                             )
-                        )
-                        if success:
-                            st.session_state.logged_in = True
-                            st.session_state.session_string = result
-                            st.success("Authentication successful!")
-                            st.rerun()
-                        elif result == "2fa_required":
-                            st.session_state.requires_2fa = True
-                            st.info("Two-factor authentication is enabled on your account.")
-                            st.rerun()
-                        elif result == "invalid_code":
-                            st.error("❌ Invalid verification code. Please check and try again.")
-                        elif result == "code_expired":
-                            st.error("⏰ Verification code has expired. Please click 'Resend Code' to get a new one.")
-                        else:
-                            st.error(f"Verification failed: {result}")
-                    except Exception as e:
-                        st.error(f"Error during verification: {str(e)}")
+                            if status == "code_sent":
+                                st.session_state.temp_session = session_result
+                                st.success("New code sent!")
+                                st.rerun()
+                            else:
+                                st.error(f"Error sending new code: {status}")
+                        except Exception as e:
+                            st.error(f"Error: {str(e)}")
             
-            # Add troubleshooting tips
-            with st.expander("🔧 Troubleshooting Tips"):
-                st.markdown("""
-                **If verification keeps failing:**
-                1. Make sure you're entering the EXACT 5-digit code
-                2. Enter the code within 2-3 minutes of receiving it
-                3. Try requesting a new code with the 'Resend Code' button
-                4. Check if you have 2FA enabled on your Telegram account
-                5. Make sure your phone number format is correct (+1234567890)
-                6. Try using a different device or network
-                """)
+            if st.button("✅ Verify Code", type="primary") and verification_code:
+                if len(verification_code) != 5 or not verification_code.isdigit():
+                    st.error("Please enter exactly 5 digits")
+                else:
+                    with st.spinner("Verifying code..."):
+                        try:
+                            success, session_result, status = asyncio.run(
+                                st.session_state.authenticator.verify_code(
+                                    st.session_state.phone, 
+                                    verification_code,
+                                    st.session_state.temp_session
+                                )
+                            )
+                            
+                            if success:
+                                st.session_state.logged_in = True
+                                st.session_state.session_string = session_result
+                                st.success("🎉 Authentication successful!")
+                                st.rerun()
+                            elif status == "2fa_required":
+                                st.session_state.requires_2fa = True
+                                st.session_state.temp_session = session_result
+                                st.info("🔒 Two-factor authentication required")
+                                st.rerun()
+                            elif status == "code_expired":
+                                st.error("⏰ Code expired! Click 'New Code' to get a fresh one.")
+                            elif status == "invalid_code":
+                                st.error("❌ Invalid code. Check the number and try again.")
+                            else:
+                                st.error(f"Verification failed: {status}")
+                        except Exception as e:
+                            st.error(f"Error during verification: {str(e)}")
             
-            # Add a reset button to start over
-            if st.button("🔙 Start Over with Different Phone Number"):
-                for key in ['phone_entered', 'code_sent', 'phone', 'phone_code_hash', 'requires_2fa']:
+            # Reset option
+            if st.button("🔙 Use Different Phone Number"):
+                for key in ['phone_entered', 'code_sent', 'phone', 'temp_session', 'requires_2fa']:
                     if key in st.session_state:
                         del st.session_state[key]
                 st.rerun()
         
         elif st.session_state.get('requires_2fa', False):
-            st.info("🔒 Your account has Two-Factor Authentication enabled.")
-            st.markdown("Please enter your 2FA password:")
+            st.info("🔒 Your account has Two-Factor Authentication enabled")
+            password = st.text_input("2FA Password:", type="password", help="Your Telegram 2FA password")
             
-            password = st.text_input("2FA Password:", type="password", help="Enter your Telegram 2FA password")
-            
-            if st.button("Verify 2FA Password", type="primary") and password:
-                try:
-                    success, result = asyncio.run(
-                        authenticate_user(
-                            int(api_id), 
-                            api_hash, 
-                            st.session_state.phone,
-                            password=password
+            if st.button("Verify 2FA", type="primary") and password:
+                with st.spinner("Verifying 2FA password..."):
+                    try:
+                        success, session_result, status = asyncio.run(
+                            st.session_state.authenticator.verify_2fa(
+                                password,
+                                st.session_state.temp_session
+                            )
                         )
-                    )
-                    if success:
-                        st.session_state.logged_in = True
-                        st.session_state.session_string = result
-                        st.success("Authentication successful!")
-                        st.rerun()
-                    else:
-                        st.error(f"2FA verification failed: {result}")
-                except Exception as e:
-                    st.error(f"Error during 2FA verification: {str(e)}")
+                        
+                        if success:
+                            st.session_state.logged_in = True
+                            st.session_state.session_string = session_result
+                            st.success("🎉 2FA verification successful!")
+                            st.rerun()
+                        else:
+                            st.error(f"2FA failed: {status}")
+                    except Exception as e:
+                        st.error(f"2FA error: {str(e)}")
 
     # Main functionality
     if st.session_state.logged_in:
@@ -398,13 +426,9 @@ def main():
                         
                         async def leave_groups():
                             nonlocal success_count
-                            if 'session_string' in st.session_state:
-                                client = TelegramClient(StringSession(st.session_state.session_string), int(api_id), api_hash)
-                            else:
-                                client = TelegramClient(StringSession(), int(api_id), api_hash)
+                            client = TelegramClient(StringSession(st.session_state.session_string), int(api_id), api_hash)
                             
-                            await client.connect()
-                            try:
+                            async with client:
                                 for i, group_name in enumerate(selected_groups):
                                     entity_info = group_options[group_name]
                                     success = await leave_entity_by_info(client, entity_info)
@@ -412,8 +436,6 @@ def main():
                                         success_count += 1
                                     progress_bar.progress((i + 1) / len(selected_groups))
                                     await asyncio.sleep(1.5)  # Rate limiting
-                            finally:
-                                await client.disconnect()
                         
                         try:
                             asyncio.run(leave_groups())
@@ -426,7 +448,7 @@ def main():
 
 # Logout functionality
 if st.sidebar.button("🚪 Logout", key="logout"):
-    for key in ['client', 'logged_in', 'phone_entered', 'code_sent', 'phone', 'phone_code_hash', 'session_string', 'found_groups', 'requires_2fa']:
+    for key in ['client', 'logged_in', 'phone_entered', 'code_sent', 'phone', 'phone_code_hash', 'session_string', 'found_groups', 'requires_2fa', 'authenticator', 'temp_session']:
         if key in st.session_state:
             del st.session_state[key]
     st.rerun()
