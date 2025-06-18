@@ -204,6 +204,7 @@ def main():
                         st.session_state.code_sent = True
                         st.session_state.phone_code_hash = result
                         st.success("Verification code sent! Please check your Telegram app.")
+                        st.info("⏰ Note: Verification codes expire in a few minutes. Enter it quickly or use the resend button if needed.")
                         st.rerun()
                     elif success:
                         st.session_state.logged_in = True
@@ -217,7 +218,26 @@ def main():
         
         elif st.session_state.code_sent:
             st.info("Please enter the verification code sent to your Telegram app.")
-            verification_code = st.text_input("Verification Code:")
+            st.warning("⏰ Verification codes expire quickly (2-3 minutes). If expired, use the resend button below.")
+            
+            col1, col2 = st.columns([3, 1])
+            
+            with col1:
+                verification_code = st.text_input("Verification Code:", placeholder="Enter 5-digit code")
+            
+            with col2:
+                if st.button("🔄 Resend Code"):
+                    try:
+                        success, result = asyncio.run(authenticate_user(int(api_id), api_hash, st.session_state.phone))
+                        if not success and result != "code_sent":
+                            st.session_state.phone_code_hash = result
+                            st.success("New verification code sent!")
+                            st.rerun()
+                        else:
+                            st.error("Error resending code")
+                    except Exception as e:
+                        st.error(f"Error resending code: {str(e)}")
+            
             if st.button("Verify Code") and verification_code:
                 try:
                     success, result = asyncio.run(
@@ -235,9 +255,23 @@ def main():
                         st.success("Authentication successful!")
                         st.rerun()
                     else:
-                        st.error(f"Verification failed: {result}")
+                        if "expired" in result.lower():
+                            st.error("⏰ Verification code has expired. Please click 'Resend Code' to get a new one.")
+                        else:
+                            st.error(f"Verification failed: {result}")
                 except Exception as e:
-                    st.error(f"Error: {str(e)}")
+                    error_msg = str(e)
+                    if "expired" in error_msg.lower():
+                        st.error("⏰ Verification code has expired. Please click 'Resend Code' to get a new one.")
+                    else:
+                        st.error(f"Error: {error_msg}")
+            
+            # Add a reset button to start over
+            if st.button("🔙 Start Over with Different Phone Number"):
+                for key in ['phone_entered', 'code_sent', 'phone', 'phone_code_hash']:
+                    if key in st.session_state:
+                        del st.session_state[key]
+                st.rerun()
 
     # Main functionality
     if st.session_state.logged_in:
