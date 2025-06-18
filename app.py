@@ -1,6 +1,7 @@
 import streamlit as st
 import asyncio
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 from telethon.tl.types import Channel, Chat
 from telethon.tl.functions.channels import LeaveChannelRequest
 from telethon.tl.functions.messages import DeleteChatUserRequest
@@ -78,9 +79,10 @@ with st.sidebar:
 def get_target_groups_sync(api_id, api_hash, word, session_string=None):
     """Synchronous wrapper for async function to work with Streamlit caching"""
     async def _get_groups():
-        client = TelegramClient('session', api_id, api_hash)
         if session_string:
-            client.session.load(session_string)
+            client = TelegramClient(StringSession(session_string), api_id, api_hash)
+        else:
+            client = TelegramClient(StringSession(), api_id, api_hash)
         
         await client.connect()
         matches = []
@@ -111,8 +113,8 @@ async def leave_entity_by_id(client, entity_id, entity_type):
 
 async def authenticate_user(api_id, api_hash, phone, verification_code=None, phone_code_hash=None):
     """Handle user authentication"""
+    client = TelegramClient(StringSession(), api_id, api_hash)
     try:
-        client = TelegramClient('session', api_id, api_hash)
         await client.connect()
         
         if not await client.is_user_authorized():
@@ -236,9 +238,10 @@ def main():
                         
                         async def leave_groups():
                             nonlocal success_count
-                            client = TelegramClient('session', int(api_id), api_hash)
                             if 'session_string' in st.session_state:
-                                client.session.load(st.session_state.session_string)
+                                client = TelegramClient(StringSession(st.session_state.session_string), int(api_id), api_hash)
+                            else:
+                                client = TelegramClient(StringSession(), int(api_id), api_hash)
                             
                             await client.connect()
                             try:
